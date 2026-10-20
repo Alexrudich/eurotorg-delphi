@@ -1,0 +1,22 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ProjectGuid>{B4E1A9C7-3D52-4F86-9A10-6E7C25B8D341}</ProjectGuid>
+  </PropertyGroup>
+  <ItemGroup>
+    <Projects Include="Warehouse.dproj">
+      <Dependencies/>
+    </Projects>
+    <Projects Include="smoke.dproj">
+      <Dependencies/>
+    </Projects>
+  </ItemGroup>
+  <ProjectExtensions>
+    <Borland.Personality>Default.Personality.12</Borland.Personality>
+    <Borland.ProjectType/>
+    <BorlandProject>
+      <Default.Personality/>
+    </BorlandProject>
+    <ProjectFileVersion>12</ProjectFileVersion>
+  </ProjectExtensions>
+  <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>
