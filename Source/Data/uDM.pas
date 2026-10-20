@@ -1,20 +1,7 @@
 unit uDM;
 
-{ ============================================================================
-  uDM — единственный модуль доступа к данным.
-
-  ПОЧЕМУ НАСЛЕДУЕТСЯ ОТ TComponent, А НЕ ОТ TDataModule:
-    TDataModule при создании ищет в exe ресурс .dfm/.fmx и бросает
-    EResNotFound, если ресурса нет. Нам ресурс не нужен: все компоненты
-    создаются кодом в конструкторе. TComponent даёт ровно то же самое
-    (владение компонентами, автоосвобождение), но без зависимости от DFM.
-    Когда добавим FMX-формы с .fmx — базовый класс поменяем без изменения
-    публичного API, формы этого не заметят.
-
-  Почему один модуль на все запросы, а не подключение в каждой форме:
-    соединение живёт дольше формы. Аналог в .NET — единый DbContext/репозиторий,
-    а не new SqlConnection в каждом обработчике клика.
-  ============================================================================ }
+{ uDM — слой доступа к БД. Один модуль, единый TFDConnection,
+  наследуется от TComponent, а не TDataModule, чтобы не искать .dfm. }
 
 interface
 
@@ -24,21 +11,12 @@ uses
   FireDAC.Stan.Def, FireDAC.Stan.Async,
   FireDAC.Stan.Param,
   FireDAC.Phys, FireDAC.Phys.ODBCBase, FireDAC.Phys.ODBC,
-  // FireDAC.Phys.MSSQL нужен, хотя класса TFDPhysMSSQLDriver в коде нет.
-  // В initialization-секции этого юнита вызывается FDRegisterDriverClass,
-  // который заносит драйвер с DriverID='MSSQL' в реестр драйверов FireDAC.
-  // Без юнита запись в реестре отсутствует, и DriverID='MSSQL' даёт ошибку
-  // -340 «Driver ID is not defined». FireDAC.Phys.ODBC регистрирует только
-  // универсальный 'ODBC' — он про SQL Server ничего не знает.
+  // MSSQL-драйвер регистрирует DriverID='MSSQL' в своей initialization;
+  // без юнита FireDAC отвечает -340 «Driver ID is not defined».
   FireDAC.Phys.MSSQL,
   FireDAC.Comp.Client,
-  // FireDAC.DApt обязателен, хотя в тексте кода ни одного его имени нет.
-  // FireDAC разбит на слои: Phys.* умеет говорить с драйвером, Comp.Client
-  // даёт класс TFDQuery, а DApt («Data Access Provider») при подключении
-  // юнита регистрирует в объектной фабрике класс курсора, который превращает
-  // ответ драйвера в обычный TDataSet. Без него TFDQuery.Open падает с
-  // «Object factory for class {3E9B315B-...} is missing» — по сути это
-  // аналог отсутствующего провайдера ADO.NET.
+  // DApt обязателен: без него TFDQuery.Open падает с «Object factory
+  // for class {3E9B315B-...} is missing».
   FireDAC.DApt;
 
 type
@@ -53,11 +31,9 @@ type
     Price: Extended;
   end;
 
-  // Снимок состояния курсоров справочников: какие из них были открыты до
-  // операции. Расход и приход закрывают их на время транзакции и обязаны
-  // вернуть в исходное состояние — иначе гриды вкладок опустеют.
-  // Batches — курсор списка партий вкладки «Расход»: он такой же «постоянно
-  // открытый», как и справочники, поэтому участвует в сохранении наравне.
+  // Снимок состояния курсоров: какие были открыты до операции.
+  // На время транзакции курсоры закрываем (на соединении без MARS живёт
+  // один активный курсор), после — обязаны вернуть как было.
   TDictCursorState = record
     Goods: Boolean;
     Warehouses: Boolean;
@@ -96,8 +72,7 @@ type
     function GetDatabaseName: string;
     // Белый список для ORDER BY: принимает только «Колонка» или
     // «Колонка ASC|DESC» из AAllowed, иначе возвращает ADefault.
-    // ORDER BY параметром не параметризуется (это не значение, а часть
-    // плана запроса), поэтому единственный безопасный путь — сверка
+    // ORDER BY параметром не параметризуется, поэтому только сверка
     // со списком разрешённых имён.
     function SafeSort(const ASortBy: string;
       const AAllowed: array of string; const ADefault: string): string;
@@ -116,7 +91,7 @@ type
     // --- диагностика ---
     function ServerVersion: string;  // @@VERSION — проверка, что коннект живой
 
-    // --- отчёт «остатки на дату и время» (SPECIFICATION.md II.2.4) ---
+    // --- отчёт «остатки на дату и время» ---
     // Открывает FQryStock процедурой dbo.usp_StockOnDate и возвращает её как
     // TDataSet для вывода в TGrid. Вызывающий НЕ освобождает датасет.
     function StockOnDate(const ATarget: TDateTime): TDataSet;
@@ -147,18 +122,18 @@ type
     procedure PlaceUpdate(APlaceId: Integer; AWarehouseId: Integer; const APlaceName: string);
     procedure PlaceDelete(APlaceId: Integer);
 
-    // --- приход (SPECIFICATION.md II.2.3) ---
+    // --- приход ---
     // В одной транзакции создаёт Batch, Document (DocType=1), DocumentLine
     // и StockMovement (+). Возвращает DocumentId.
     // AExpiryDate <= 0 означает «срок не задан» -> в БД уходит NULL.
     // ADocDate используется и как Batch.IncomeDate (ключ FIFO), и как
     // StockMovement.MovementDate: отчёт «на дату» обязан показывать прошлое
-    // таким, каким оно было, поэтомуMovementDate берётся из документа,
+    // таким, каким оно было, поэтому MovementDate берётся из документа,
     // а не из SYSDATETIME().
     function DocumentIncome(AGoodsId, APlaceId: Int64; AQnty, APrice: Extended;
       ADocDate, AExpiryDate: TDateTime; const AComment: string): Integer;
 
-    // --- расход (SPECIFICATION.md II.2.3) ---
+    // --- расход ---
     // Список партий товара, отсортированный по IncomeDate ASC (FIFO-порядок).
     // Остаток считается суммой StockMovement, а не по Batch.Quantity:
     // движение точнее отражает историю. AShowZero = True добавляет к списку
@@ -210,13 +185,8 @@ type
     function GoodsTotalLeft(AGoodsId: Int64): Extended;
 
     // --- свойства для чтения открытых курсоров справочников формой ---
-    // Эти же датасеты используются гридами CRUD; форма читает их для
-    // заполнения комбобоксов прихода без новых запросов (без MARS нельзя
-    // держать два активных курсора на одном соединении).
-    // Тип свойства — TFDQuery, а не TDataSet: в Object Pascal тип свойства
-    // обязан совпадать с типом поля-геттера (неявное восходящее приведение
-    // разрешено только в операторах присваивания, но не в объявлении).
-    // Вызывающий код спокойно использует их как TDataSet.
+    // Те же датасеты держат гриды CRUD; форма читает их для комбобоксов
+    // без новых запросов (без MARS два активных курсора не удержать).
     property GoodsDataSet: TFDQuery read FQryGoods;
     property WarehousesDataSet: TFDQuery read FQryWarehouses;
     property PlacesDataSet: TFDQuery read FQryPlaces;
@@ -299,35 +269,27 @@ end;
 
 procedure TDM.ApplyConnectionParams;
 begin
-  // FireDAC через ODBC-драйвер. Почему не родной MSSQL-драйвер (OLE DB)?
-  // На этой машине ODBC Driver 18 для SQL Server уже настроен, а OLE DB
-  // требует отдельного провайдера. ODBC работает из коробки.
-  // Порядок важен: DriverName присваиваем ПОСЛЕ Params.Clear.
-  //   FCon.DriverName := 'MSSQL' изнутри пишет значение в Params (ключ
-  //   'DriverID'), поэтому любой Clear ПОСЛЕ присваивания стёр бы его —
-  //   это и была ошибка -340 «Driver ID is not defined».
+  // ODBC Driver 18: на этой машине он уже стоит, OLE DB потребовал бы
+  // отдельного провайдера.
+  // Порядок важен: DriverName присваиваем ПОСЛЕ Params.Clear — присваивание
+  // DriverName пишет значение в Params ('DriverID'), и любой Clear после
+  // него стёр бы его (ошибка -340 «Driver ID is not defined»).
   FCon.Params.Clear;
   FCon.DriverName := 'MSSQL';
-  // Ключ называется ODBCDriver (константа S_FD_ConnParam_ODBC_ODBCDriver в
-  // FireDAC.Stan.Consts.pas), а не DriverName: 'DriverName' — это имя
-  // свойства TFDConnection, и как параметр строки подключения оно игнорируется.
+  // Ключ называется ODBCDriver, а не DriverName: 'DriverName' — имя свойства
+  // TFDConnection, как параметр строки подключения оно игнорируется.
   FCon.Params.Add('ODBCDriver=ODBC Driver 18 for SQL Server');
   FCon.Params.Add('Server=' + ServerName);
   FCon.Params.Add('Database=' + DatabaseName);
-  // Windows-аутентификация. Ключ FireDAC называется OSAuthent, а НЕ
-  // Trusted_Connection: в FireDAC.Phys.MSSQL.pas (строка 494) задан маппинг
-  // 'OSAuthent' -> 'Trusted_Connection', то есть FireDAC сам подставит
-  // нужный ODBC-ключ. Без OSAuthent запрос уходит без логина, и сервер
-  // отвечает "Login failed for user ''".
+  // Windows-аутентификация. В FireDAC ключ называется OSAuthent, а не
+  // Trusted_Connection — сам маппится на нужный ODBC-ключ. Без OSAuthent
+  // сервер отвечает "Login failed for user ''".
   FCon.Params.Add('OSAuthent=Yes');
-  // Драйвер 18 по умолчанию шифрует соединение и требует доверенный сертификат.
-  // У локального SQLEXPRESS сертификат самоподписанный, поэтому его нужно
-  // явно разрешить. ВАЖНО: писать 'TrustServerCertificate=Yes' обычным
-  // параметром бесполезно — драйвер MSSQL в FireDAC знает ограниченное число
-  // ключей (Server, Database, Encrypt, MARS...) и прочие молча выбрасывает,
-  // в ODBC-строку они не попадают (см. BuildODBCConnectString в
-  // FireDAC.Phys.ODBCBase.pas). Kлюч ODBCDriver/ODBCAdvanced — исключение:
-  // FireDAC дописывает его содержимое в строку подключения как есть.
+  // Драйвер 18 по умолчанию шифрует соединение и требует доверенный
+  // сертификат; у локального SQLEXPRESS он самоподписанный. Обычным
+  // параметром TrustServerCertificate не передать — драйвер MSSQL в FireDAC
+  // знает ограниченное число ключей и прочие молча выбрасывает.
+  // ODBCAdvanced дописывается в строку подключения как есть.
   FCon.Params.Add('ODBCAdvanced=TrustServerCertificate=Yes;Connection Timeout=15');
 end;
 
@@ -371,7 +333,7 @@ function TDM.StockOnDate(const ATarget: TDateTime): TDataSet;
 begin
   Connect;
   FQryStock.Close;
-  // Вызов хранимой процедуры параметризованно: конкатенации дат нет (II.4).
+  // Вызов хранимой процедуры параметризованно: конкатенации дат нет.
   FQryStock.SQL.Clear;
   FQryStock.SQL.Add('EXEC dbo.usp_StockOnDate :ATarget');
   FQryStock.ParamByName('ATarget').DataType := ftDateTime;
@@ -591,12 +553,9 @@ begin
 end;
 
 // ============================================================================
-// Курсоры справочников: общее сохранение/восстановление
-//
-// Без MARS (для MSSQL-драйвера FireDAC его не включают) на одном соединении
-// живёт один активный серверный курсор. Гриды справочников держат курсоры
-// открытыми, поэтому на время транзакции их закрывают, а после — обязаны
-// вернуть в прежнее состояние, иначе вкладки опустеют.
+// Курсоры справочников: сохранение/восстановление
+// Без MARS на одном соединении живёт один активный курсор, поэтому на время
+// транзакции гридовые курсоры закрываем и потом открываем обратно.
 // ============================================================================
 
 procedure TDM.SaveAndCloseDictCursors(out AState: TDictCursorState);
@@ -626,7 +585,7 @@ begin
 end;
 
 // ============================================================================
-// Приходный документ (SPECIFICATION.md II.2.3)
+// Приходный документ
 // ============================================================================
 
 function TDM.DocumentIncome(AGoodsId, APlaceId: Int64; AQnty, APrice: Extended;
@@ -644,7 +603,7 @@ begin
   try
     FTransaction.StartTransaction;
     try
-    // 1. Batch — партия создаётся сразу, Quantity сразу итоговый.
+    // 1. Batch — Quantity сразу итоговый.
     FQry.Close;
     FQry.SQL.Text :=
       'INSERT INTO dbo.Batch (GoodsId, PlaceId, Quantity, Price, IncomeDate, ExpiryDate) ' +
@@ -669,10 +628,9 @@ begin
       'INSERT INTO dbo.Document (DocType, DocDate, [Comment]) ' +
       'OUTPUT INSERTED.DocumentId VALUES (1, :DocDate, :Comment)';
     FQry.ParamByName('DocDate').AsDateTime := ADocDate;
-    // DataType для Comment — NVARCHAR(255): обязателен ftWideString.
-    // С ftString параметр уходит как SQL_VARCHAR, ODBC перекодирует его
-    // через однобайтовую кодировку, и кириллица сохраняется как «?????».
-    // Значение Null — только после установки DataType (MSSQL-335).
+    // ftWideString обязателен: с ftString параметр уходит как SQL_VARCHAR,
+    // ODBC перекодирует через однобайтовую кодировку и кириллица
+    // сохраняется как «?????». Null — только после DataType (MSSQL-335).
     FQry.ParamByName('Comment').DataType := ftWideString;
     if AComment <> '' then
       FQry.ParamByName('Comment').AsString := AComment
@@ -710,23 +668,21 @@ begin
     Result := DocId;
   except
     FTransaction.Rollback;
-    raise;                       // сообщение уходит вызывающему, в статус формы
+    raise;
   end;
 finally
-  // Курсоры возвращаем в любом случае — даже при ошибке интерфейс должен
-  // оставаться рабочим. Без finally курсоры «зависали» бы закрытыми.
+  // Курсоры возвращаем при любом исходе, иначе вкладки останутся пустыми.
   RestoreDictCursors(DictState);
 end;
 end;
 
 // ============================================================================
-// Расходный документ (SPECIFICATION.md II.2.3)
+// Расходный документ
 // ============================================================================
 
 // Общий движок списания. ATakes — уже готовые «партия + количество»:
-// ручный режим передаёт одну строку, FIFO — несколько. Курсоры справочников
-// здесь НЕ трогаются: вызывающий обязан закрыть их до и восстановить после
-// (FIFO читает список партий, и этому чтению тоже нужно свободное соединение).
+// ручной режим передаёт одну строку, FIFO — несколько. Курсоры здесь НЕ
+// трогаются: закрывает и восстанавливает их вызывающий.
 function TDM.DoOutcome(const ATakes: array of TBatchTake; ADocDate: TDateTime;
   const AComment: string): Integer;
 var
@@ -809,7 +765,7 @@ function TDM.OpenBatchesForGoods(AGoodsId: Int64;
 begin
   Connect;
   FQryBatches.Close;
-  // Остаток партии = сумма всех движений (регистр — точка истины, см. II.2.4).
+  // Остаток партии = сумма всех движений (регистр — точка истины).
   // Порядок IncomeDate ASC = FIFO: первая строка — самая старая партия.
   FQryBatches.SQL.Clear;
   FQryBatches.SQL.Text :=
@@ -884,9 +840,9 @@ var
   Remaining: Extended;
   DictState: TDictCursorState;
 
-  // Источниковое SQL для набора FIFO: тот же запрос, что в OpenBatchesForGoods,
-  // но с фильтром склада. Собираем в массив TBatchTake — транзакция не должна
-  // держать открытый курсор во время записи (один курсор на соединение).
+  // Запрос для набора FIFO: тот же, что в OpenBatchesForGoods, но с фильтром
+  // склада. Результат сразу собираем в массив TBatchTake — транзакция не
+  // должна держать открытый курсор во время записи (один курсор на соединение).
   procedure Collect;
   var
     Idx: Integer;
@@ -1058,9 +1014,8 @@ end;
 // ============================================================================
 // Peek: расчёт без записи (для диалога подтверждения)
 //
-// Контракт: при успехе возвращает текст для диалога («что будет списано»),
-// при неудаче бросает Exception с понятной причиной. Форма ловит try/except:
-// исключение = показать текст в статусе, строка = показать диалог подтверждения.
+// При успехе возвращают текст для диалога («что будет списано»), при неудаче
+// бросают Exception с причиной. Форма различает исход через try/except.
 // ============================================================================
 
 function TDM.PeekOutcomeFIFO(AGoodsId, AWarehouseId: Int64;
@@ -1105,14 +1060,13 @@ begin
     begin
       QtyLeft := FQry.FieldByName('QtyLeft').AsExtended;
       if QtyLeft <= 1e-9 then Break;
-      // Память под строку выделяем ДО присваивания: Parts[N] при длине 0
-      // бросает Range check error (это и была прежняя «авария предпросмотра»).
+      // SetLength ДО присваивания: Parts[N] при нулевой длине массива
+      // бросает Range check error.
       SetLength(Parts, N + 1);
       if QtyLeft >= Remaining then
       begin
-        // %d в Delphi RTL корректно принимает Int64 (tftInt64); %I64d —
-        // формат C-рантайма, Delphi его не знает и бросает «invalid format».
-        // Настоящий Range check error вызывал запись Parts[N] до SetLength.
+        // %d в Delphi RTL принимает Int64; %I64d — формат C-рантайма,
+        // Delphi его не знает и бросает «invalid format».
         Parts[N] := Format('Партия %d -> %g', [
           FQry.FieldByName('BatchId').AsLargeInt, Remaining]);
         Remaining := 0;
@@ -1136,8 +1090,7 @@ begin
     raise Exception.Create(Format(
       'Недостаточно остатка: не хватает %g шт', [Remaining]));
 
-  // Собираем список партий в строку через перенос: Join* в System.StrUtils
-  // нет, а тащить ради одной операции целый юнит не стоит.
+  // Склейка списка партий через перенос строки.
   S := '';
   for i := 0 to N - 1 do
   begin
@@ -1192,17 +1145,14 @@ begin
 end;
 
 // ============================================================================
-// Перемещение партии между местами (SPECIFICATION.md II.2.3, DocType=2)
+// Перемещение партии между местами, DocType=2
 //
-// Если переносится вся партия — меняем PlaceId у существующей строки Batch
-// (иначе в таблице копятся партии с Quantity = 0).
-// Если часть — партия расщепляется: новая Batch с ТЕМИ ЖЕ GoodsId, Price,
-// IncomeDate и ExpiryDate, но другим PlaceId.
+// Партия всегда расщепляется: на новом месте создаётся новая Batch с ТЕМИ ЖЕ
+// Price, IncomeDate и ExpiryDate, но другим PlaceId; старая уменьшается.
 //
 // IncomeDate обязан сохраняться: это ключ FIFO. Если подставить дату
 // документа, перемещённая партия «помолодеет» и уедет в конец очереди
-// списания — скоропорт перестанет списываться первым.
-// ExpiryDate — иначе теряется срок годности.
+// списания.
 // ============================================================================
 
 function TDM.DocumentTransfer(ABatchId, ANewPlaceId: Int64;

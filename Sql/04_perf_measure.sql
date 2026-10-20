@@ -46,7 +46,7 @@ HAVING ISNULL(SUM(m.Quantity), 0) > 0
 ORDER BY b.IncomeDate, b.BatchId;
 GO
 
-/* --- 3. Поиск LIKE (аналог GoodsService.OpenFiltered) --------------------- */
+/* --- 3. Поиск LIKE (как в OpenGoods) ------------------------------------- */
 PRINT '=== 3. Поиск LIKE ''Товар_00001'' в 5000 товарах ===';
 SELECT GoodsId, GoodsName FROM dbo.Goods
 WHERE GoodsName LIKE N'Товар_00001%'
